@@ -1,25 +1,22 @@
 #!/bin/bash
-# AtherixCloud Tunnel v5 (Auto reconnect + auto restore)
+# Atherix Tunnel v6 (fixed list + random fallback + restore)
 
 SERVER="45.10.165.199"
 USER="tunnel"
 SSH_PORT=22
 
-CONFIG_DIR="$HOME/.atherix-tunnel"
-KEY_FILE="$CONFIG_DIR/.key"
-LOG_DIR="$CONFIG_DIR/logs"
-PID_DIR="$CONFIG_DIR/pids"
-PORTS_FILE="$CONFIG_DIR/ports"
+CONFIG="$HOME/.atherix-tunnel"
+KEY="$CONFIG/.key"
+PID_DIR="$CONFIG/pids"
+PORTS="$CONFIG/ports"
+LOG="$CONFIG/logs"
 
-mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$PID_DIR"
-chmod 700 "$CONFIG_DIR"
-
-RED="\e[31m"; GRN="\e[32m"; YEL="\e[33m"; CYN="\e[36m"; RST="\e[0m"
+mkdir -p "$PID_DIR" "$LOG"
 
 # SSH key
 setup_key(){
-if [ ! -f "$KEY_FILE" ];then
-cat>"$KEY_FILE"<<'KEY'
+if [ ! -f "$KEY" ];then
+cat>"$KEY"<<'KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACBJEK7mHycRjc8BFmcqL7PjJFgcDaRhFaDPinB8fjS54wAAAJhiOSxDYjks
@@ -28,57 +25,52 @@ AAAEAy5wkmy3eoL+/RPuv+kv0s473dRWyOCFmvTBUCLPn89EkQruYfJxGNzwEWZyovs+Mk
 WBwNpGEVoM+KcHx+NLnjAAAAFXR1bm5lbC1yZXN0cmljdGVkLWtleQ==
 -----END OPENSSH PRIVATE KEY-----
 KEY
-chmod 600 "$KEY_FILE"
+chmod 600 "$KEY"
 fi
 }
 
-# Проверка туннеля
-tunnel_alive(){
-pid="$1"
-kill -0 "$pid" 2>/dev/null
+# Проверка жив ли
+alive(){
+kill -0 "$1" 2>/dev/null
 }
 
 # Проверка порта
-check_remote_port(){
-local port="$1"
-ssh -i "$KEY_FILE" \
+check_port(){
+ssh -i "$KEY" \
 -o StrictHostKeyChecking=no \
 -o UserKnownHostsFile=/dev/null \
 -p $SSH_PORT \
-$USER@$SERVER "ss -tuln | grep -q :$port" >/dev/null 2>&1
-return $?
+$USER@$SERVER "ss -tuln | grep -q :$1" >/dev/null 2>&1
 }
 
 # Запуск
-start_tunnel(){
+start(){
 local port="$1"
-local pid_file="$PID_DIR/tunnel-$port.pid"
-local log_file="$LOG_DIR/tunnel-$port.log"
+local pid_file="$PID_DIR/$port.pid"
+local log="$LOG/$port.log"
 
 setup_key
 
-# Если туннель уже был
+# очистка старого
 if [ -f "$pid_file" ];then
-old_pid=$(cat "$pid_file")
-if tunnel_alive "$old_pid"; then
-echo -e "${GRN}Tunnel already running on $port${RST}"
-return
-else
-echo -e "${YEL}Old tunnel dead → restarting${RST}"
+pid=$(cat "$pid_file")
+if ! alive "$pid";then
 rm -f "$pid_file"
+else
+echo "Already running"
+return
 fi
 fi
 
-# Проверка занят ли порт
-check_remote_port "$port"
-if [ $? -eq 0 ]; then
-echo -e "${YEL}Port $port busy → random fallback${RST}"
+# fallback
+check_port "$port"
+if [ $? -eq 0 ];then
 REMOTE="0:localhost:$port"
 else
 REMOTE="$port:localhost:$port"
 fi
 
-ssh -i "$KEY_FILE" \
+ssh -i "$KEY" \
 -o StrictHostKeyChecking=no \
 -o UserKnownHostsFile=/dev/null \
 -o ServerAliveInterval=30 \
@@ -86,86 +78,93 @@ ssh -i "$KEY_FILE" \
 -o ExitOnForwardFailure=yes \
 -N -f \
 -R $REMOTE \
-$USER@$SERVER \
--p $SSH_PORT \
->"$log_file" 2>&1
+$USER@$SERVER -p $SSH_PORT \
+>"$log" 2>&1
 
 sleep 3
 
-ssh_pid=$(pgrep -f "ssh.*$SERVER.*$port" | head -1)
+pid=$(pgrep -f "ssh.*$SERVER.*$port" | head -1)
 
-if [ -n "$ssh_pid" ];then
-echo "$ssh_pid" > "$pid_file"
-grep -qx "$port" "$PORTS_FILE" 2>/dev/null || echo "$port" >> "$PORTS_FILE"
-echo -e "${GRN}Tunnel active: $port${RST}"
-else
-echo -e "${RED}Failed${RST}"
-fi
-}
-
-# Остановка
-stop_tunnel(){
-port="$1"
-kill "$(cat "$PID_DIR/tunnel-$port.pid" 2>/dev/null)" 2>/dev/null
-rm -f "$PID_DIR/tunnel-$port.pid"
-sed -i "/^$port$/d" "$PORTS_FILE"
-}
-
-# Список
-list_tunnels(){
-cat "$PORTS_FILE" 2>/dev/null
-}
-
-# Восстановление после перезапуска
-restore_tunnels(){
-if [ ! -f "$PORTS_FILE" ];then
+if [ -z "$pid" ];then
+echo "Failed"
 return
 fi
 
-while read -r port;do
-start_tunnel "$port"
-done < "$PORTS_FILE"
+echo "$pid" > "$pid_file"
+
+# получить внешний порт
+if grep -q "Allocated port" "$log";then
+remote=$(grep "Allocated port" "$log" | grep -oE '[0-9]{4,5}' | head -1)
+else
+remote="$port"
+fi
+
+# сохранить
+grep -v "^$port " "$PORTS" 2>/dev/null > "$PORTS.tmp"
+echo "$port $remote" >> "$PORTS.tmp"
+mv "$PORTS.tmp" "$PORTS"
+
+echo "Public: http://$SERVER:$remote"
 }
 
-# Watchdog (авто reconnect)
-watchdog(){
+# список
+list(){
+if [ ! -f "$PORTS" ];then
+echo "No tunnels"
+return
+fi
+
+while read -r port remote;do
+pid_file="$PID_DIR/$port.pid"
+if [ -f "$pid_file" ] && alive "$(cat "$pid_file")";then
+echo "Local $port → http://$SERVER:$remote"
+else
+# авто очистка
+sed -i "/^$port /d" "$PORTS"
+fi
+done < "$PORTS"
+}
+
+# стоп
+stop(){
+kill "$(cat "$PID_DIR/$1.pid" 2>/dev/null)" 2>/dev/null
+rm -f "$PID_DIR/$1.pid"
+sed -i "/^$1 /d" "$PORTS"
+}
+
+# восстановление
+restore(){
+while read -r port _;do
+start "$port"
+done < "$PORTS" 2>/dev/null
+}
+
+# watchdog
+watch(){
 while true;do
 sleep 20
-while read -r port;do
-pid_file="$PID_DIR/tunnel-$port.pid"
-if [ -f "$pid_file" ];then
-pid=$(cat "$pid_file")
-if ! tunnel_alive "$pid";then
-echo "Tunnel $port died → reconnect"
-start_tunnel "$port"
-fi
-fi
-done < "$PORTS_FILE" 2>/dev/null
+restore
 done
 }
 
 # MAIN
 case "$1" in
 [0-9]*)
-start_tunnel "$1"
-;;
-stop)
-stop_tunnel "$2"
+start "$1"
 ;;
 list)
-list_tunnels
+list
 ;;
-restore)
-restore_tunnels
+stop)
+stop "$2"
 ;;
 watch)
-watchdog
+watch
 ;;
 *)
 echo "Usage:"
 echo "tunnel <port>"
-echo "tunnel stop <port>"
 echo "tunnel list"
-echo "tunnel watch"
+echo "tunnel stop <port>"
 ;;
 esac
