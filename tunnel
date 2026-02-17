@@ -1,5 +1,5 @@
 #!/bin/bash
-# Atherix Tunnel v8 (fixed random fallback)
+# Atherix Tunnel v9
 
 SERVER="45.10.165.199"
 USER="tunnel"
@@ -7,11 +7,11 @@ SSH_PORT=22
 
 BASE="$HOME/.atherix-tunnel"
 KEY="$BASE/.key"
-PID_DIR="$BASE/pids"
+PID="$BASE/pids"
 PORTS="$BASE/ports"
-LOG_DIR="$BASE/logs"
+LOG="$BASE/logs"
 
-mkdir -p "$PID_DIR" "$LOG_DIR"
+mkdir -p "$PID" "$LOG"
 
 # SSH key
 setup_key(){
@@ -31,14 +31,24 @@ fi
 
 alive(){ kill -0 "$1" 2>/dev/null; }
 
+# проверка remote порта
+check_port(){
+ssh -i "$KEY" \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+-p $SSH_PORT \
+$USER@$SERVER "ss -tuln | grep -q :$1" >/dev/null 2>&1
+return $?
+}
+
 start(){
 port="$1"
 setup_key
 
-pid_file="$PID_DIR/$port.pid"
-log="$LOG_DIR/$port.log"
+pid_file="$PID/$port.pid"
+log="$LOG/$port.log"
 
-# cleanup old
+# очистка
 if [ -f "$pid_file" ]; then
 pid=$(cat "$pid_file")
 if alive "$pid"; then
@@ -49,43 +59,37 @@ rm -f "$pid_file"
 fi
 fi
 
-# random fallback
-echo "Checking remote..."
+echo "Checking VDS port..."
 
+# если порт свободен → фиксированный
+check_port "$port"
+if [ $? -ne 0 ]; then
 REMOTE="$port:localhost:$port"
-
-# сначала пробуем фиксированный
-ssh -i "$KEY" \
--o StrictHostKeyChecking=no \
--o UserKnownHostsFile=/dev/null \
--o ExitOnForwardFailure=yes \
--N -f -R $REMOTE \
-$USER@$SERVER -p $SSH_PORT >"$log" 2>&1
-
-sleep 2
-
-# если не удалось → random
-if ! pgrep -f "ssh.*$SERVER.*$port" >/dev/null; then
-echo "Port busy → random"
+echo "Port free → using $port"
+else
+# если занят → random
 REMOTE="0:localhost:$port"
-
-ssh -i "$KEY" \
--o StrictHostKeyChecking=no \
--o UserKnownHostsFile=/dev/null \
--o ExitOnForwardFailure=yes \
--N -f -R $REMOTE \
-$USER@$SERVER -p $SSH_PORT >>"$log" 2>&1
-
-sleep 3
+echo "Port busy → random"
 fi
 
-pid=$(pgrep -f "ssh.*$SERVER.*$port" | head -1)
+ssh -i "$KEY" \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+-o ServerAliveInterval=30 \
+-o ServerAliveCountMax=3 \
+-o ExitOnForwardFailure=yes \
+-N -f \
+-R $REMOTE \
+$USER@$SERVER -p $SSH_PORT >"$log" 2>&1
 
+sleep 3
+
+pid=$(pgrep -f "ssh.*$SERVER.*$port" | head -1)
 [ -z "$pid" ] && { echo "Fail"; return; }
 
 echo "$pid" > "$pid_file"
 
-# получить random порт
+# получить внешний порт
 remote="$port"
 
 if grep -q "Allocated port" "$log"; then
@@ -97,6 +101,7 @@ grep -v "^$port " "$PORTS" 2>/dev/null > "$PORTS.tmp"
 echo "$port $remote" >> "$PORTS.tmp"
 mv "$PORTS.tmp" "$PORTS"
 
+echo
 echo "Public: http://$SERVER:$remote"
 }
 
@@ -104,9 +109,9 @@ list(){
 [ ! -f "$PORTS" ] && { echo "No tunnels"; return; }
 
 while read -r p r; do
-pid_file="$PID_DIR/$p.pid"
+pid_file="$PID/$p.pid"
 if [ -f "$pid_file" ] && alive "$(cat "$pid_file")"; then
-echo "$p → http://$SERVER:$r"
+echo "Local $p → http://$SERVER:$r"
 else
 sed -i "/^$p /d" "$PORTS"
 fi
@@ -114,8 +119,8 @@ done < "$PORTS"
 }
 
 stop(){
-kill "$(cat "$PID_DIR/$1.pid" 2>/dev/null)" 2>/dev/null
-rm -f "$PID_DIR/$1.pid"
+kill "$(cat "$PID/$1.pid" 2>/dev/null)" 2>/dev/null
+rm -f "$PID/$1.pid"
 sed -i "/^$1 /d" "$PORTS"
 }
 
