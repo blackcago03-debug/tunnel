@@ -1,0 +1,174 @@
+#!/bin/bash
+# ══════════════════════════════════════════════════════════════════
+#  AtherixCloud Tunnel v3.0 - Fixed Port Forwarding
+# ══════════════════════════════════════════════════════════════════
+
+SERVER="45.10.165.199"
+USER="tunnel"
+SSH_PORT=22
+
+CONFIG_DIR="$HOME/.atherix-tunnel"
+KEY_FILE="$CONFIG_DIR/.key"
+LOG_DIR="$CONFIG_DIR/logs"
+PID_DIR="$CONFIG_DIR/pids"
+
+mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$PID_DIR" 2>/dev/null
+chmod 700 "$CONFIG_DIR" 2>/dev/null
+
+# Colors
+RED="\e[31m"; GRN="\e[32m"; YEL="\e[33m"; CYN="\e[36m"; WHT="\e[97m"
+GRY="\e[90m"; BOLD="\e[1m"; DIM="\e[2m"; UNDER="\e[4m"; RST="\e[0m"
+
+# ══════════════════════════════════════════════════════════════════
+# SSH KEY
+# ══════════════════════════════════════════════════════════════════
+setup_key(){
+if [ ! -f "$KEY_FILE" ];then
+cat>"$KEY_FILE"<<'KEY'
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACBJEK7mHycRjc8BFmcqL7PjJFgcDaRhFaDPinB8fjS54wAAAJhiOSxDYjks
+QwAAAAtzc2gtZWQyNTUxOQAAACBJEK7mHycRjc8BFmcqL7PjJFgcDaRhFaDPinB8fjS54w
+AAAEAy5wkmy3eoL+/RPuv+kv0s473dRWyOCFmvTBUCLPn89EkQruYfJxGNzwEWZyovs+Mk
+WBwNpGEVoM+KcHx+NLnjAAAAFXR1bm5lbC1yZXN0cmljdGVkLWtleQ==
+-----END OPENSSH PRIVATE KEY-----
+KEY
+chmod 600 "$KEY_FILE"
+fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+# CHECK PORT ON SERVER
+# ══════════════════════════════════════════════════════════════════
+check_remote_port(){
+local port="$1"
+
+ssh -i "$KEY_FILE" \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+-p $SSH_PORT \
+$USER@$SERVER "ss -tuln | grep -q :$port" >/dev/null 2>&1
+return $?
+}
+
+# ══════════════════════════════════════════════════════════════════
+# START TUNNEL
+# ══════════════════════════════════════════════════════════════════
+start_tunnel(){
+local port="$1"
+local pid_file="$PID_DIR/tunnel-$port.pid"
+local map_file="$CONFIG_DIR/.port-$port"
+local log_file="$LOG_DIR/tunnel-$port.log"
+
+# Validate port
+if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ];then
+echo -e "${RED}Invalid port${RST}"
+return 1
+fi
+
+# Check if already running
+if [ -f "$pid_file" ];then
+local pid=$(cat "$pid_file")
+if kill -0 "$pid" 2>/dev/null;then
+echo -e "${YEL}Tunnel already active on port $port${RST}"
+return 0
+fi
+fi
+
+setup_key
+
+echo -e "${CYN}Checking port on server...${RST}"
+
+check_remote_port "$port"
+if [ $? -eq 0 ]; then
+echo -e "${RED}✗ Port $port already in use on server${RST}"
+return 1
+fi
+
+echo -e "${GRN}Starting tunnel...${RST}"
+
+ssh -i "$KEY_FILE" \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile=/dev/null \
+-o ExitOnForwardFailure=yes \
+-o ServerAliveInterval=30 \
+-o ServerAliveCountMax=3 \
+-o ConnectTimeout=10 \
+-N -f \
+-R $port:localhost:$port \
+$USER@$SERVER \
+-p $SSH_PORT \
+>"$log_file" 2>&1
+
+sleep 2
+
+local ssh_pid=$(pgrep -f "ssh.*-R.*$port.*$SERVER" | head -1)
+
+if [ -n "$ssh_pid" ];then
+echo "$ssh_pid" > "$pid_file"
+echo "$port" > "$map_file"
+
+echo
+echo -e "${GRN}✓ Tunnel active${RST}"
+echo -e "Local: localhost:$port"
+echo -e "Public: http://$SERVER:$port"
+else
+echo -e "${RED}✗ Failed${RST}"
+echo "Log: $log_file"
+fi
+}
+
+# ══════════════════════════════════════════════════════════════════
+# STOP
+# ══════════════════════════════════════════════════════════════════
+stop_tunnel(){
+local port="$1"
+local pid_file="$PID_DIR/tunnel-$port.pid"
+
+if [ ! -f "$pid_file" ];then
+echo "No tunnel"
+return
+fi
+
+kill "$(cat "$pid_file")" 2>/dev/null
+rm -f "$pid_file"
+echo "Stopped port $port"
+}
+
+# ══════════════════════════════════════════════════════════════════
+# LIST
+# ══════════════════════════════════════════════════════════════════
+list_tunnels(){
+for pid_file in "$PID_DIR"/tunnel-*.pid;do
+[ -f "$pid_file" ] || continue
+local port=$(basename "$pid_file" .pid | sed 's/tunnel-//')
+local pid=$(cat "$pid_file")
+
+if kill -0 "$pid" 2>/dev/null;then
+echo "Port $port → http://$SERVER:$port"
+else
+rm -f "$pid_file"
+fi
+done
+}
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
+case "$1" in
+[0-9]*)
+start_tunnel "$1"
+;;
+stop)
+stop_tunnel "$2"
+;;
+list)
+list_tunnels
+;;
+*)
+echo "Usage:"
+echo "tunnel <port>"
+echo "tunnel stop <port>"
+echo "tunnel list"
+;;
+esac
