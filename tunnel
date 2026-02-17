@@ -1,21 +1,21 @@
 #!/bin/bash
-# Atherix Tunnel v6 (fixed list + random fallback + restore)
+# Atherix Tunnel v7
 
 SERVER="45.10.165.199"
 USER="tunnel"
 SSH_PORT=22
 
-CONFIG="$HOME/.atherix-tunnel"
-KEY="$CONFIG/.key"
-PID_DIR="$CONFIG/pids"
-PORTS="$CONFIG/ports"
-LOG="$CONFIG/logs"
+BASE="$HOME/.atherix-tunnel"
+KEY="$BASE/.key"
+PID="$BASE/pids"
+PORTS="$BASE/ports"
+LOG="$BASE/logs"
 
-mkdir -p "$PID_DIR" "$LOG"
+mkdir -p "$PID" "$LOG"
 
 # SSH key
 setup_key(){
-if [ ! -f "$KEY" ];then
+if [ ! -f "$KEY" ]; then
 cat>"$KEY"<<'KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -29,32 +29,29 @@ chmod 600 "$KEY"
 fi
 }
 
-# Проверка жив ли
-alive(){
-kill -0 "$1" 2>/dev/null
-}
+# alive
+alive(){ kill -0 "$1" 2>/dev/null; }
 
-# Проверка порта
+# check port
 check_port(){
-ssh -i "$KEY" \
--o StrictHostKeyChecking=no \
+ssh -i "$KEY" -o StrictHostKeyChecking=no \
 -o UserKnownHostsFile=/dev/null \
--p $SSH_PORT \
-$USER@$SERVER "ss -tuln | grep -q :$1" >/dev/null 2>&1
+-p $SSH_PORT $USER@$SERVER \
+"ss -tuln | grep -q :$1" >/dev/null 2>&1
 }
 
-# Запуск
+# start
 start(){
-local port="$1"
-local pid_file="$PID_DIR/$port.pid"
-local log="$LOG/$port.log"
-
+port="$1"
 setup_key
 
-# очистка старого
-if [ -f "$pid_file" ];then
+pid_file="$PID/$port.pid"
+log="$LOG/$port.log"
+
+# очистка
+if [ -f "$pid_file" ]; then
 pid=$(cat "$pid_file")
-if ! alive "$pid";then
+if ! alive "$pid"; then
 rm -f "$pid_file"
 else
 echo "Already running"
@@ -62,9 +59,10 @@ return
 fi
 fi
 
-# fallback
+# fallback random
 check_port "$port"
-if [ $? -eq 0 ];then
+if [ $? -eq 0 ]; then
+echo "Port busy → random"
 REMOTE="0:localhost:$port"
 else
 REMOTE="$port:localhost:$port"
@@ -76,24 +74,18 @@ ssh -i "$KEY" \
 -o ServerAliveInterval=30 \
 -o ServerAliveCountMax=3 \
 -o ExitOnForwardFailure=yes \
--N -f \
--R $REMOTE \
-$USER@$SERVER -p $SSH_PORT \
->"$log" 2>&1
+-N -f -R $REMOTE \
+$USER@$SERVER -p $SSH_PORT >"$log" 2>&1
 
 sleep 3
 
 pid=$(pgrep -f "ssh.*$SERVER.*$port" | head -1)
-
-if [ -z "$pid" ];then
-echo "Failed"
-return
-fi
+[ -z "$pid" ] && { echo "Fail"; return; }
 
 echo "$pid" > "$pid_file"
 
 # получить внешний порт
-if grep -q "Allocated port" "$log";then
+if grep -q "Allocated port" "$log"; then
 remote=$(grep "Allocated port" "$log" | grep -oE '[0-9]{4,5}' | head -1)
 else
 remote="$port"
@@ -107,60 +99,32 @@ mv "$PORTS.tmp" "$PORTS"
 echo "Public: http://$SERVER:$remote"
 }
 
-# список
+# list
 list(){
-if [ ! -f "$PORTS" ];then
-echo "No tunnels"
-return
-fi
+[ ! -f "$PORTS" ] && { echo "No tunnels"; return; }
 
-while read -r port remote;do
-pid_file="$PID_DIR/$port.pid"
-if [ -f "$pid_file" ] && alive "$(cat "$pid_file")";then
-echo "Local $port → http://$SERVER:$remote"
+while read -r port remote; do
+pid_file="$PID/$port.pid"
+if [ -f "$pid_file" ] && alive "$(cat "$pid_file")"; then
+echo "$port → http://$SERVER:$remote"
 else
-# авто очистка
 sed -i "/^$port /d" "$PORTS"
 fi
 done < "$PORTS"
 }
 
-# стоп
+# stop
 stop(){
-kill "$(cat "$PID_DIR/$1.pid" 2>/dev/null)" 2>/dev/null
-rm -f "$PID_DIR/$1.pid"
+kill "$(cat "$PID/$1.pid" 2>/dev/null)" 2>/dev/null
+rm -f "$PID/$1.pid"
 sed -i "/^$1 /d" "$PORTS"
-}
-
-# восстановление
-restore(){
-while read -r port _;do
-start "$port"
-done < "$PORTS" 2>/dev/null
-}
-
-# watchdog
-watch(){
-while true;do
-sleep 20
-restore
-done
 }
 
 # MAIN
 case "$1" in
-[0-9]*)
-start "$1"
-;;
-list)
-list
-;;
-stop)
-stop "$2"
-;;
-watch)
-watch
-;;
+[0-9]*) start "$1" ;;
+list) list ;;
+stop) stop "$2" ;;
 *)
 echo "Usage:"
 echo "tunnel <port>"
